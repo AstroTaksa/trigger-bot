@@ -1,5 +1,5 @@
 // ============================================================
-//  Kill on Look v1.1.3 — мод для Minecraft 1.21.4 (Fabric)
+//  Kill on Look v1.1.5 — мод для Minecraft 1.21.4 (Fabric)
 //  Все исходники в одном файле (для чтения).
 //  Реально проект собирается из 5 файлов в папке killonlook\
 //
@@ -16,9 +16,14 @@
 //     за тик; пока камера крутится, ударов нет). После доводки —
 //     пауза 2 тика, чтобы сервер получил поворот ДО удара.
 //     Для тестов своего сервера с GrimAC.
+//   - «Тригер-бот» — строгий режим: бьёт ТОЛЬКО когда прицел на цели
+//     и между глазами и целью нет блоков (сквозь стены ударов нет)
 //   - «Таргет-ESP» — зелёный прямоугольник вокруг текущей цели,
 //     виден сквозь стены (цель проецируется в экранные координаты
 //     и рисуется в HUD), с именем цели над рамкой.
+//   - «Авто-спринт» — бежит вперёд сам (работает даже при выключенном
+//     моде; при открытых экранах не мешает)
+//   - Плюс один маленький бонус мода — найдёшь в игре сам :)
 //   - Всё сохраняется в .minecraft/config/killonlook.json
 // ============================================================
 
@@ -55,9 +60,12 @@ import net.minecraft.server.world.ServerWorld;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.Hand;
+import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.EntityHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.RaycastContext;
 import org.joml.Matrix4f;
 import org.joml.Vector4f;
 import net.minecraft.world.World;
@@ -103,6 +111,8 @@ class KillAuraConfig {
     public boolean instantKill = false; // мгновенное убийство (одиночная игра)
     public boolean aura = false;        // бить без наведения (с доворотом к цели)
     public boolean esp = false;         // прямоугольник вокруг текущей цели
+    public boolean triggerBot = false;  // бить только по видимой цели под прицелом
+    public boolean autoSprint = false;  // автоматически бежать вперёд
 
     // Бинды (GLFW-коды клавиш; -1 = не назначено)
     public int bindOpenGui = 344;  // Right Shift
@@ -169,17 +179,21 @@ class KillAuraScreen extends Screen {
         int x = this.width / 2 - 100;
         int y = 32;
 
-        addDrawableChild(toggle(x, y, "Мод включён", () -> cfg.enabled, v -> cfg.enabled = v)); y += 20;
-        addDrawableChild(slider(x, y)); y += 20;
-        addDrawableChild(toggle(x, y, "Враждебные мобы", () -> cfg.hostile, v -> cfg.hostile = v)); y += 20;
-        addDrawableChild(toggle(x, y, "Животные", () -> cfg.animals, v -> cfg.animals = v)); y += 20;
-        addDrawableChild(toggle(x, y, "Жители", () -> cfg.villagers, v -> cfg.villagers = v)); y += 20;
-        addDrawableChild(toggle(x, y, "Игроки", () -> cfg.players, v -> cfg.players = v)); y += 20;
-        addDrawableChild(toggle(x, y, "Мгновенно убивать (одиночная игра)", () -> cfg.instantKill, v -> cfg.instantKill = v)); y += 20;
-        addDrawableChild(toggle(x, y, "Аура (бить без наведения)", () -> cfg.aura, v -> cfg.aura = v)); y += 20;
-        addDrawableChild(toggle(x, y, "Таргет-ESP (прямоугольник)", () -> cfg.esp, v -> cfg.esp = v)); y += 24;
+        addDrawableChild(toggle(x, y, "Мод включён", () -> cfg.enabled, v -> cfg.enabled = v)); y += 19;
+        addDrawableChild(slider(x, y)); y += 19;
+        // категории — в два столбца, чтобы всё влезло на экран
+        addDrawableChild(toggle(x, y, "Мобы", () -> cfg.hostile, v -> cfg.hostile = v));
+        addDrawableChild(toggle(x + 102, y, "Животные", () -> cfg.animals, v -> cfg.animals = v)); y += 19;
+        addDrawableChild(toggle(x, y, "Жители", () -> cfg.villagers, v -> cfg.villagers = v));
+        addDrawableChild(toggle(x + 102, y, "Игроки", () -> cfg.players, v -> cfg.players = v)); y += 19;
 
-        addDrawableChild(bindButton(x, y, "Открыть гуишку", () -> cfg.bindOpenGui, code -> cfg.bindOpenGui = code)); y += 20;
+        addDrawableChild(toggle(x, y, "Мгновенно убивать (одиночная игра)", () -> cfg.instantKill, v -> cfg.instantKill = v)); y += 19;
+        addDrawableChild(toggle(x, y, "Аура (бить без наведения)", () -> cfg.aura, v -> cfg.aura = v)); y += 19;
+        addDrawableChild(toggle(x, y, "Таргет-ESP (прямоугольник)", () -> cfg.esp, v -> cfg.esp = v)); y += 19;
+        addDrawableChild(toggle(x, y, "Тригер-бот (только видимые)", () -> cfg.triggerBot, v -> cfg.triggerBot = v)); y += 19;
+        addDrawableChild(toggle(x, y, "Авто-спринт", () -> cfg.autoSprint, v -> cfg.autoSprint = v)); y += 23;
+
+        addDrawableChild(bindButton(x, y, "Открыть гуишку", () -> cfg.bindOpenGui, code -> cfg.bindOpenGui = code)); y += 19;
         addDrawableChild(bindButton(x, y, "Вкл/выкл мод", () -> cfg.bindToggle, code -> cfg.bindToggle = code));
     }
 
@@ -259,7 +273,7 @@ class KillAuraScreen extends Screen {
         super.render(context, mouseX, mouseY, delta);
         context.drawCenteredTextWithShadow(this.textRenderer, this.title, this.width / 2, 15, 0xFFFFFF);
         context.drawCenteredTextWithShadow(this.textRenderer,
-                Text.literal("ESC — закрыть · настройки сохраняются сами"), this.width / 2, this.height - 14, 0xFFAAAAAA);
+                Text.literal("ESC — закрыть · настройки сохраняются сами"), this.width / 2, 26, 0xFFAAAAAA);
     }
 
     @Override
@@ -284,6 +298,11 @@ class KillAuraHandler {
 
     /** Цель, выбранная модом в этом тике (для ESP). */
     public static LivingEntity currentTarget = null;
+
+    /** Сколько сущностей мод убил за сессию. */
+    public static int kills = 0;
+
+    private static LivingEntity lastHit = null;
 
     private static int cooldown = 0;
     private static int rotateDelay = 0; // тиков ожидания после доворота к цели
@@ -314,6 +333,21 @@ class KillAuraHandler {
         prevOpenDown = openDown;
         prevToggleDown = toggleDown;
 
+        // --- Авто-спринт (независим от главного переключателя) ---
+        if (cfg.autoSprint && client.player != null && client.currentScreen == null) {
+            client.options.sprintKey.setPressed(true);
+        }
+
+        // --- Учёт убийств ---
+        if (lastHit != null) {
+            if (lastHit.isDead() || !lastHit.isAlive()) {
+                kills++;
+                lastHit = null;
+            } else if (client.world == null || lastHit.getWorld() != client.world) {
+                lastHit = null; // сменили мир — счёт не трогаем
+            }
+        }
+
         if (cooldown > 0) cooldown--;
         if (client.player == null || !cfg.enabled || client.interactionManager == null) {
             currentTarget = null;
@@ -321,6 +355,10 @@ class KillAuraHandler {
         }
         if (client.currentScreen != null) {
             currentTarget = null;
+            if (cfg.autoSprint) {
+                // при открытой гуишке сбрасываем, чтобы спринт не «залип»
+                client.options.sprintKey.setPressed(false);
+            }
             return;
         }
 
@@ -343,6 +381,12 @@ class KillAuraHandler {
         currentTarget = target;
         if (target == null) return;
 
+        // Тригер-бот: бьём только по видимой цели (сквозь стены ударов нет)
+        if (cfg.triggerBot && !canSee(client, target)) {
+            currentTarget = null;
+            return;
+        }
+
         // Если бьём мимо прицела — плавно доворачиваемся к цели
         if (!lookingAtTarget) {
             if (needsRotation(client.player, target)) {
@@ -361,6 +405,7 @@ class KillAuraHandler {
 
         if (cfg.instantKill && client.getServer() != null) {
             // Одиночная игра: убиваем сущность напрямую на серверной стороне
+            lastHit = target;
             UUID id = target.getUuid();
             RegistryKey<World> worldKey = client.world.getRegistryKey();
             MinecraftServer server = client.getServer();
@@ -375,6 +420,7 @@ class KillAuraHandler {
             });
         } else {
             // Обычный удар (работает и на серверах, но с обычным уроном)
+            lastHit = target;
             client.interactionManager.attackEntity(client.player, target);
             client.player.swingHand(Hand.MAIN_HAND);
         }
@@ -396,6 +442,15 @@ class KillAuraHandler {
             }
         }
         return best;
+    }
+
+    /** Видна ли цель (нет ли блоков между глазами и точкой прицеливания). */
+    private static boolean canSee(MinecraftClient client, LivingEntity target) {
+        Vec3d eyes = client.player.getEyePos();
+        Vec3d aim = aimPoint(target, eyes);
+        BlockHitResult hit = client.world.raycast(new RaycastContext(
+                eyes, aim, RaycastContext.ShapeType.COLLIDER, RaycastContext.FluidHandling.NONE, client.player));
+        return hit.getType() == HitResult.Type.MISS;
     }
 
     /** Точка прицеливания: ближайшая к глазам точка хитбокса (или центр, если глаза внутри). */
@@ -508,6 +563,13 @@ class KillAuraEspRenderer {
 
     /** Рисует рамку поверх всего мира (в HUD) — поэтому видна сквозь стены. */
     private static void onHudRender(DrawContext context, RenderTickCounter tickCounter) {
+        // маленький бонус мода — счётчик убийств за сессию
+        if (KillAuraHandler.kills > 0) {
+            MinecraftClient client = MinecraftClient.getInstance();
+            context.drawTextWithShadow(client.textRenderer,
+                    Text.literal("Kill on Look · убийств: " + KillAuraHandler.kills), 4, 4, 0xFF8FFF8F);
+        }
+
         if (!KillOnLookClient.config.esp || rect == null) return;
 
         int x1 = rect[0], y1 = rect[1], x2 = rect[2], y2 = rect[3];
