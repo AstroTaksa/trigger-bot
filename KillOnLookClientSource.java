@@ -1,29 +1,22 @@
 // ============================================================
-//  Kill on Look v1.1.5 — мод для Minecraft 1.21.4 (Fabric)
+//  Kill on Look v1.2.0 — мод для Minecraft 1.21.4 (Fabric)
 //  Все исходники в одном файле (для чтения).
-//  Реально проект собирается из 5 файлов в папке killonlook\
+//  Реально проект собирается из 6 файлов в папке killonlook\
+//  (в т.ч. миксин killonlook/mixin/ClientPlayerEntityMixin.java)
 //
 //  Функции:
-//   - Гуишка (бинд по умолчанию Right Shift), ESC — закрыть
-//   - Ползунок «Удары в секунду» от 1 до 10
-//   - Бинды: «Открыть гуишку» и «Вкл/выкл мод» — клик по кнопке,
-//     затем нажми клавишу (ESC — отмена)
-//   - Категории: враждебные мобы / животные / жители / игроки
-//   - «Мгновенно убивать» — только одиночная игра
-//   - «Аура (бить без наведения)» — бьёт ближайшую подходящую
-//     сущность в ванильном радиусе атаки (3.0 блока), перед ударом
-//     ОЧЕНЬ плавно доворачивая камеру к цели (30% оставшегося угла
-//     за тик; пока камера крутится, ударов нет). После доводки —
-//     пауза 2 тика, чтобы сервер получил поворот ДО удара.
-//     Для тестов своего сервера с GrimAC.
-//   - «Тригер-бот» — строгий режим: бьёт ТОЛЬКО когда прицел на цели
-//     и между глазами и целью нет блоков (сквозь стены ударов нет)
-//   - «Таргет-ESP» — зелёный прямоугольник вокруг текущей цели,
-//     виден сквозь стены (цель проецируется в экранные координаты
-//     и рисуется в HUD), с именем цели над рамкой.
-//   - «Авто-спринт» — бежит вперёд сам (работает даже при выключенном
-//     моде; при открытых экранах не мешает)
-//   - Плюс один маленький бонус мода — найдёшь в игре сам :)
+//   - КЛИК-ГУИ как в чит-клиентах: панели Combat / Targets / Misc /
+//     Binds с фиолетовыми шапками, таскаются мышкой за шапку
+//   - «Аура» — бьёт ближайшую цель в ванильном радиусе атаки (3.0)
+//     со СКРЫТНОЙ ротацией: камера не крутится, поворот уходит на
+//     сервер пакетами (миксин), на F5 видно тело с доворотом
+//   - «Аим-ассист» — плавно доворачивает КАМЕРУ к ближайшей цели,
+//     сам НЕ бьёт; в паре с тригер-ботом = наводка + удар
+//   - «Тригер-бот» — МГНОВЕННЫЙ удар, как только прицел коснулся
+//     видимой цели (сквозь стены не бьёт)
+//   - «Авто-спринт» — бежит вперёд сам
+//   - HUD: водяной знак, счётчик убийств за сессию, список
+//     включённых модулей справа (как ArrayList у читов)
 //   - Всё сохраняется в .minecraft/config/killonlook.json
 // ============================================================
 
@@ -40,11 +33,8 @@ import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
-import net.minecraft.client.gui.widget.ButtonWidget;
-import net.minecraft.client.gui.widget.SliderWidget;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.render.RenderTickCounter;
-import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.client.util.InputUtil;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.LivingEntity;
@@ -54,7 +44,6 @@ import net.minecraft.entity.passive.AnimalEntity;
 import net.minecraft.entity.passive.MerchantEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.registry.RegistryKey;
-import net.minecraft.screen.ScreenTexts;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.text.Text;
@@ -66,21 +55,25 @@ import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.RaycastContext;
-import org.joml.Matrix4f;
-import org.joml.Vector4f;
 import net.minecraft.world.World;
 import org.lwjgl.glfw.GLFW;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.IntSupplier;
+import java.util.function.Supplier;
 
 // ============================================================
 // 1. KillOnLookClient — входная точка мода.
-//    Загружает конфиг и вешает обработчик игрового тика.
 // ============================================================
 public class KillOnLookClient implements ClientModInitializer {
 
@@ -89,29 +82,29 @@ public class KillOnLookClient implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         config = KillAuraConfig.load();
-        KillAuraEspRenderer.register();
+        KillAuraHud.register();
 
-        ClientTickEvents.END_CLIENT_TICK.register(client -> KillAuraHandler.tick(client, config));
+        // Логика — в НАЧАЛЕ тика: пакет удара должен уходить ДО пакетов
+        // движения (как у ванильного клиента), иначе Grim флагает Post.
+        ClientTickEvents.START_CLIENT_TICK.register(client -> KillAuraHandler.tick(client, config));
     }
 }
 
 // ============================================================
-// 2. KillAuraConfig — настройки мода.
-//    Скорость ударов, категории, бинды, аура. Сохраняется в
-//    .minecraft/config/killonlook.json (JSON, читается Gson'ом).
+// 2. KillAuraConfig — настройки мода (JSON в config/killonlook.json).
 // ============================================================
 class KillAuraConfig {
 
     public boolean enabled = false;
-    public int hitsPerSecond = 5;       // удары в секунду (от 1 до 10)
+    public int hitsPerSecond = 5;       // удары в секунду ауры (от 1 до 10)
     public boolean hostile = true;      // зомби, скелеты, крипперы и т.д.
     public boolean animals = false;     // коровы, свиньи, овцы и т.д.
     public boolean villagers = false;   // жители и бродячие торговцы
     public boolean players = false;     // игроки
     public boolean instantKill = false; // мгновенное убийство (одиночная игра)
-    public boolean aura = false;        // бить без наведения (с доворотом к цели)
-    public boolean esp = false;         // прямоугольник вокруг текущей цели
-    public boolean triggerBot = false;  // бить только по видимой цели под прицелом
+    public boolean aura = false;        // бить ближайшую цель (со скрытной ротацией)
+    public boolean aimAssist = false;   // плавно наводит камеру на цель, сам не бьёт
+    public boolean triggerBot = false;  // мгновенный удар по видимой цели под прицелом
     public boolean autoSprint = false;  // автоматически бежать вперёд
 
     // Бинды (GLFW-коды клавиш; -1 = не назначено)
@@ -156,124 +149,241 @@ class KillAuraConfig {
 }
 
 // ============================================================
-// 3. KillAuraScreen — гуишка настроек.
-//    Переключатели категорий, ползунок скорости, аура, кнопки
-//    биндов (клик — затем нажимаешь клавишу, ESC — отмена).
+// 3. KillAuraScreen — клик-гуи в стиле чит-клиентов.
+//    Панели Combat / Targets / Misc / Binds с фиолетовыми шапками,
+//    таскаются мышкой за шапку. Клик по строке — действие.
 // ============================================================
 class KillAuraScreen extends Screen {
 
-    private final KillAuraConfig cfg = KillOnLookClient.config;
+    private static final int PANEL_W = 110;
+    private static final int HEADER_H = 12;
+    private static final int ROW_H = 11;
 
-    // Ожидание нажатия клавиши для перепривязки бинда
-    private String listeningName = null;
+    private static final int HEADER_COLOR1 = 0xFFA55BC7; // фиолетовый верх
+    private static final int HEADER_COLOR2 = 0xFF7D3F9E; // фиолетовый низ
+    private static final int BODY_COLOR = 0xD60E0E14;    // тёмный корпус
+    private static final int ROW_ON = 0xFFC79BF2;        // включённый модуль
+    private static final int ROW_OFF = 0xFF9A9AA5;       // выключенный
+
+    /** Строка панели. */
+    private static class Row {
+        final Supplier<String> label; // текст строки
+        final Runnable onClick;       // действие при клике
+        final BooleanSupplier active; // подсветка включённого
+        boolean isBind;               // строка бинда (ловит следующую клавишу)
+
+        Row(Supplier<String> label, Runnable onClick, BooleanSupplier active, boolean isBind) {
+            this.label = label;
+            this.onClick = onClick;
+            this.active = active;
+            this.isBind = isBind;
+        }
+    }
+
+    private static class Panel {
+        final String title;
+        int x, y;
+        final List<Row> rows = new ArrayList<>();
+
+        Panel(String title, int x, int y) {
+            this.title = title;
+            this.x = x;
+            this.y = y;
+        }
+
+        int height() {
+            return HEADER_H + rows.size() * ROW_H + 2;
+        }
+    }
+
+    private final List<Panel> panels = new ArrayList<>();
+    private Panel dragging = null;
+    private int dragOffX, dragOffY;
+
+    // перепривязка бинда: следующая нажатая клавиша станет биндом
+    private boolean listening = false;
     private IntSupplier listeningGetter = null;
     private Consumer<Integer> listeningSetter = null;
-    private ButtonWidget listeningButton = null;
 
     public KillAuraScreen() {
-        super(Text.literal("Kill on Look — настройки"));
+        super(Text.literal("Kill on Look — click gui"));
+    }
+
+    private static String keyName(int keyCode) {
+        return keyCode <= 0 ? "нет" : InputUtil.fromKeyCode(keyCode, 0).getLocalizedText().getString();
     }
 
     @Override
     protected void init() {
-        int x = this.width / 2 - 100;
-        int y = 32;
+        panels.clear();
+        listening = false;
+        listeningGetter = null;
+        listeningSetter = null;
+        dragging = null;
 
-        addDrawableChild(toggle(x, y, "Мод включён", () -> cfg.enabled, v -> cfg.enabled = v)); y += 19;
-        addDrawableChild(slider(x, y)); y += 19;
-        // категории — в два столбца, чтобы всё влезло на экран
-        addDrawableChild(toggle(x, y, "Мобы", () -> cfg.hostile, v -> cfg.hostile = v));
-        addDrawableChild(toggle(x + 102, y, "Животные", () -> cfg.animals, v -> cfg.animals = v)); y += 19;
-        addDrawableChild(toggle(x, y, "Жители", () -> cfg.villagers, v -> cfg.villagers = v));
-        addDrawableChild(toggle(x + 102, y, "Игроки", () -> cfg.players, v -> cfg.players = v)); y += 19;
+        KillAuraConfig cfg = KillOnLookClient.config;
+        int gap = PANEL_W + 5;
+        int top = 24;
 
-        addDrawableChild(toggle(x, y, "Мгновенно убивать (одиночная игра)", () -> cfg.instantKill, v -> cfg.instantKill = v)); y += 19;
-        addDrawableChild(toggle(x, y, "Аура (бить без наведения)", () -> cfg.aura, v -> cfg.aura = v)); y += 19;
-        addDrawableChild(toggle(x, y, "Таргет-ESP (прямоугольник)", () -> cfg.esp, v -> cfg.esp = v)); y += 19;
-        addDrawableChild(toggle(x, y, "Тригер-бот (только видимые)", () -> cfg.triggerBot, v -> cfg.triggerBot = v)); y += 19;
-        addDrawableChild(toggle(x, y, "Авто-спринт", () -> cfg.autoSprint, v -> cfg.autoSprint = v)); y += 23;
+        // --- Combat ---
+        Panel combat = new Panel("Combat", 10, top);
+        combat.rows.add(new Row(
+                () -> "Аура: " + (cfg.aura ? "ВКЛ" : "ВЫКЛ"),
+                () -> { cfg.aura = !cfg.aura; cfg.save(); },
+                () -> cfg.aura, false));
+        combat.rows.add(new Row(
+                () -> "Аим-ассист: " + (cfg.aimAssist ? "ВКЛ" : "ВЫКЛ"),
+                () -> { cfg.aimAssist = !cfg.aimAssist; cfg.save(); },
+                () -> cfg.aimAssist, false));
+        combat.rows.add(new Row(
+                () -> "Тригер-бот: " + (cfg.triggerBot ? "ВКЛ" : "ВЫКЛ"),
+                () -> { cfg.triggerBot = !cfg.triggerBot; cfg.save(); },
+                () -> cfg.triggerBot, false));
+        combat.rows.add(new Row(
+                () -> "Удары/сек: " + cfg.hitsPerSecond,
+                () -> { cfg.hitsPerSecond = cfg.hitsPerSecond % 10 + 1; cfg.save(); },
+                () -> false, false));
+        panels.add(combat);
 
-        addDrawableChild(bindButton(x, y, "Открыть гуишку", () -> cfg.bindOpenGui, code -> cfg.bindOpenGui = code)); y += 19;
-        addDrawableChild(bindButton(x, y, "Вкл/выкл мод", () -> cfg.bindToggle, code -> cfg.bindToggle = code));
-    }
+        // --- Targets ---
+        Panel targets = new Panel("Targets", 10 + gap, top);
+        targets.rows.add(new Row(
+                () -> "Мобы: " + (cfg.hostile ? "ВКЛ" : "ВЫКЛ"),
+                () -> { cfg.hostile = !cfg.hostile; cfg.save(); },
+                () -> cfg.hostile, false));
+        targets.rows.add(new Row(
+                () -> "Животные: " + (cfg.animals ? "ВКЛ" : "ВЫКЛ"),
+                () -> { cfg.animals = !cfg.animals; cfg.save(); },
+                () -> cfg.animals, false));
+        targets.rows.add(new Row(
+                () -> "Жители: " + (cfg.villagers ? "ВКЛ" : "ВЫКЛ"),
+                () -> { cfg.villagers = !cfg.villagers; cfg.save(); },
+                () -> cfg.villagers, false));
+        targets.rows.add(new Row(
+                () -> "Игроки: " + (cfg.players ? "ВКЛ" : "ВЫКЛ"),
+                () -> { cfg.players = !cfg.players; cfg.save(); },
+                () -> cfg.players, false));
+        panels.add(targets);
 
-    /** Кнопка-переключатель: при клике меняет поле конфига и сразу сохраняет его в файл. */
-    private ButtonWidget toggle(int x, int y, String label, BooleanSupplier get, Consumer<Boolean> set) {
-        return ButtonWidget.builder(message(label, get.getAsBoolean()), button -> {
-            set.accept(!get.getAsBoolean());
-            button.setMessage(message(label, get.getAsBoolean()));
-            cfg.save();
-        }).dimensions(x, y, 200, 20).build();
-    }
+        // --- Misc ---
+        Panel misc = new Panel("Misc", 10 + gap * 2, top);
+        misc.rows.add(new Row(
+                () -> "Авто-спринт: " + (cfg.autoSprint ? "ВКЛ" : "ВЫКЛ"),
+                () -> { cfg.autoSprint = !cfg.autoSprint; cfg.save(); },
+                () -> cfg.autoSprint, false));
+        misc.rows.add(new Row(
+                () -> "Мод: " + (cfg.enabled ? "ВКЛ" : "ВЫКЛ"),
+                () -> { cfg.enabled = !cfg.enabled; cfg.save(); },
+                () -> cfg.enabled, false));
+        panels.add(misc);
 
-    private Text message(String label, boolean on) {
-        return Text.literal(label + ": ")
-                .append(Text.literal(on ? "ВКЛ" : "ВЫКЛ")
-                        .formatted(on ? Formatting.GREEN : Formatting.RED));
-    }
-
-    /** Ползунок: удары в секунду от 1 до 10. */
-    private SliderWidget slider(int x, int y) {
-        double normalized = (cfg.hitsPerSecond - 1) / 9.0;
-        normalized = Math.max(0.0, Math.min(1.0, normalized));
-        return new SliderWidget(x, y, 200, 20, sliderMessage(), normalized) {
-            @Override
-            protected void updateMessage() {
-                setMessage(sliderMessage());
-            }
-
-            @Override
-            protected void applyValue() {
-                cfg.hitsPerSecond = 1 + (int) Math.round(this.value * 9);
-                cfg.save();
-            }
-        };
-    }
-
-    private Text sliderMessage() {
-        return Text.literal("Удары в секунду: " + cfg.hitsPerSecond);
-    }
-
-    /** Кнопка бинда: клик — и следующая нажатая клавиша станет биндом (ESC — отмена). */
-    private ButtonWidget bindButton(int x, int y, String name, IntSupplier get, Consumer<Integer> set) {
-        return ButtonWidget.builder(bindLabel(name, get.getAsInt()), button -> {
-            listeningName = name;
-            listeningGetter = get;
-            listeningSetter = set;
-            listeningButton = button;
-            button.setMessage(Text.literal(name + ": нажми клавишу (ESC — отмена)"));
-        }).dimensions(x, y, 200, 20).build();
-    }
-
-    private Text bindLabel(String name, int keyCode) {
-        String key = keyCode <= 0 ? "нет" : InputUtil.fromKeyCode(keyCode, 0).getLocalizedText().getString();
-        return Text.literal(name + ": " + key);
-    }
-
-    @Override
-    public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
-        // Ловим клавишу для перепривязки бинда
-        if (listeningName != null) {
-            if (keyCode != GLFW.GLFW_KEY_ESCAPE) {
-                listeningSetter.accept(keyCode);
-                cfg.save();
-            }
-            listeningButton.setMessage(bindLabel(listeningName, listeningGetter.getAsInt()));
-            listeningName = null;
-            listeningGetter = null;
-            listeningSetter = null;
-            listeningButton = null;
-            return true;
-        }
-        return super.keyPressed(keyCode, scanCode, modifiers);
+        // --- Binds ---
+        Panel binds = new Panel("Binds", 10 + gap * 3, top);
+        binds.rows.add(new Row(
+                () -> listening ? "нажми клавишу (ESC)" : "Гуишка: " + keyName(cfg.bindOpenGui),
+                () -> {
+                    listeningGetter = () -> cfg.bindOpenGui;
+                    listeningSetter = code -> cfg.bindOpenGui = code;
+                    listening = true;
+                },
+                () -> false, true));
+        binds.rows.add(new Row(
+                () -> listening ? "нажми клавишу (ESC)" : "Тогл мода: " + keyName(cfg.bindToggle),
+                () -> {
+                    listeningGetter = () -> cfg.bindToggle;
+                    listeningSetter = code -> cfg.bindToggle = code;
+                    listening = true;
+                },
+                () -> false, true));
+        panels.add(binds);
     }
 
     @Override
     public void render(DrawContext context, int mouseX, int mouseY, float delta) {
         super.render(context, mouseX, mouseY, delta);
-        context.drawCenteredTextWithShadow(this.textRenderer, this.title, this.width / 2, 15, 0xFFFFFF);
+
+        for (Panel p : panels) {
+            int h = p.height();
+
+            // корпус
+            context.fill(p.x, p.y + HEADER_H, p.x + PANEL_W, p.y + h, BODY_COLOR);
+            // шапка с градиентом
+            context.fillGradient(p.x, p.y, p.x + PANEL_W, p.y + HEADER_H, HEADER_COLOR1, HEADER_COLOR2);
+            context.drawTextWithShadow(this.textRenderer, p.title, p.x + 3, p.y + 2, 0xFFFFFFFF);
+
+            // строки
+            int ry = p.y + HEADER_H + 1;
+            for (Row r : p.rows) {
+                String label = (r.isBind && listening) ? "нажми клавишу (ESC)" : r.label.get();
+                int color = r.active.getAsBoolean() ? ROW_ON : ROW_OFF;
+                if (r.isBind && listening) color = 0xFFFFD166; // жёлтый при ожидании клавиши
+                context.drawTextWithShadow(this.textRenderer, label, p.x + 3, ry, color);
+                ry += ROW_H;
+            }
+        }
+
         context.drawCenteredTextWithShadow(this.textRenderer,
-                Text.literal("ESC — закрыть · настройки сохраняются сами"), this.width / 2, 26, 0xFFAAAAAA);
+                Text.literal("ESC — закрыть · панели таскаются за шапку"),
+                this.width / 2, 8, 0xFFAAAAAA);
+    }
+
+    @Override
+    public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        int mx = (int) mouseX, my = (int) mouseY;
+
+        for (Panel p : panels) {
+            int h = p.height();
+
+            // клик по шапке — начинаем перетаскивание
+            if (mx >= p.x && mx <= p.x + PANEL_W && my >= p.y && my < p.y + HEADER_H) {
+                dragging = p;
+                dragOffX = mx - p.x;
+                dragOffY = my - p.y;
+                return true;
+            }
+
+            // клик по строке — действие
+            if (mx >= p.x && mx <= p.x + PANEL_W && my >= p.y + HEADER_H && my < p.y + h) {
+                int index = (my - (p.y + HEADER_H) - 1) / ROW_H;
+                if (index >= 0 && index < p.rows.size()) {
+                    p.rows.get(index).onClick.run();
+                    return true;
+                }
+            }
+        }
+        return super.mouseClicked(mouseX, mouseY, button);
+    }
+
+    @Override
+    public boolean mouseReleased(double mouseX, double mouseY, int button) {
+        dragging = null;
+        return super.mouseReleased(mouseX, mouseY, button);
+    }
+
+    @Override
+    public boolean mouseDragged(double mouseX, double mouseY, int button, double deltaX, double deltaY) {
+        if (dragging != null) {
+            dragging.x = (int) mouseX - dragOffX;
+            dragging.y = (int) mouseY - dragOffY;
+            return true;
+        }
+        return super.mouseDragged(mouseX, mouseY, button, deltaX, deltaY);
+    }
+
+    @Override
+    public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        // ловим клавишу для перепривязки бинда
+        if (listening) {
+            if (keyCode != GLFW.GLFW_KEY_ESCAPE) {
+                listeningSetter.accept(keyCode);
+                KillOnLookClient.config.save();
+            }
+            listening = false;
+            listeningGetter = null;
+            listeningSetter = null;
+            return true;
+        }
+        return super.keyPressed(keyCode, scanCode, modifiers);
     }
 
     @Override
@@ -283,10 +393,10 @@ class KillAuraScreen extends Screen {
 }
 
 // ============================================================
-// 4. KillAuraHandler — сама логика.
-//    Бинды, выбор цели (прицел → ближайшая при ауре), аккуратный
-//    доворот к цели перед ударом, удары с заданной скоростью,
-//    мгновенное убийство в одиночной игре.
+// 4. KillAuraHandler — логика: тригер-бот (мгновенный удар по
+//    прицелу), аура (скрытная ротация + удары по кулдауну),
+//    аим-ассист (плавный доворот камеры без ударов), бинды,
+//    авто-спринт, счёт убийств.
 // ============================================================
 class KillAuraHandler {
 
@@ -296,22 +406,35 @@ class KillAuraHandler {
     /** Плавность доворота: доля оставшегося угла, закрываемая за тик (меньше = плавнее). */
     private static final float TURN_FACTOR = 0.3f;
 
-    /** Цель, выбранная модом в этом тике (для ESP). */
-    public static LivingEntity currentTarget = null;
+    /** Потолок скорости доворота (градусы за тик) — чтобы не было рывков. */
+    private static final float MAX_TURN_PER_TICK = 5.0f;
+    private static final float MAX_PITCH_TURN_PER_TICK = 3.0f;
 
     /** Сколько сущностей мод убил за сессию. */
     public static int kills = 0;
 
-    private static LivingEntity lastHit = null;
+    /** Скрытная ротация: куда «смотрит» сервер (камера при этом не крутится). */
+    private static float fakeYaw = 0f;
+    private static float fakePitch = 0f;
+    private static float[] pendingFake = null;
 
-    private static int cooldown = 0;
-    private static int rotateDelay = 0; // тиков ожидания после доворота к цели
+    private static int cooldown = 0;    // пауза между ударами ауры
+    private static int aimSettled = 0;  // сколько тиков доворот к цели «устоялся»
     private static boolean prevOpenDown = false;
     private static boolean prevToggleDown = false;
+    private static LivingEntity lastHit = null;
+    private static LivingEntity auraTarget = null; // «липкая» цель наводки
 
     private KillAuraHandler() {}
 
-    /** Вызывается каждый игровой тик (20 раз в секунду). */
+    /** Забирает ротацию, которую надо отправить серверу в этом тике (или null). */
+    public static float[] pollFakeRotation() {
+        float[] f = pendingFake;
+        pendingFake = null;
+        return f;
+    }
+
+    /** Вызывается в начале каждого игрового тика (20 раз в секунду). */
     public static void tick(MinecraftClient client, KillAuraConfig cfg) {
         // --- Бинды (опрашиваем клавиши напрямую; работает, когда нет открытых экранов) ---
         long window = client.getWindow().getHandle();
@@ -349,12 +472,8 @@ class KillAuraHandler {
         }
 
         if (cooldown > 0) cooldown--;
-        if (client.player == null || !cfg.enabled || client.interactionManager == null) {
-            currentTarget = null;
-            return;
-        }
+        if (client.player == null || !cfg.enabled || client.interactionManager == null) return;
         if (client.currentScreen != null) {
-            currentTarget = null;
             if (cfg.autoSprint) {
                 // при открытой гуишке сбрасываем, чтобы спринт не «залип»
                 client.options.sprintKey.setPressed(false);
@@ -362,54 +481,87 @@ class KillAuraHandler {
             return;
         }
 
-        // --- Выбор цели ---
-        LivingEntity target = null;
-        boolean lookingAtTarget = false;
-
-        // 1) То, на что наведён прицел
-        if (client.crosshairTarget instanceof EntityHitResult hit
-                && hit.getEntity() instanceof LivingEntity le
-                && le != client.player && le.isAlive() && cfg.matches(le)) {
-            target = le;
-            lookingAtTarget = true;
+        // --- Тригер-бот: МГНОВЕННЫЙ удар, как только прицел коснулся видимой цели ---
+        if (cfg.triggerBot
+                && client.crosshairTarget instanceof EntityHitResult tHit
+                && tHit.getEntity() instanceof LivingEntity tLe
+                && tLe != client.player && tLe.isAlive() && cfg.matches(tLe)
+                && canSee(client, tLe)) {
+            attack(client, cfg, tLe);
         }
 
-        // 2) Режим «аура»: ближайшая подходящая сущность в ванильном радиусе атаки
-        if (target == null && cfg.aura) {
-            target = findNearest(client, cfg);
+        // --- Наводка (аура — скрытная, аим-ассист — камерой) ---
+        LivingEntity aimTarget = null;
+        boolean lookingAtAimTarget = false;
+        if (cfg.aura || cfg.aimAssist) {
+            if (client.crosshairTarget instanceof EntityHitResult hit
+                    && hit.getEntity() instanceof LivingEntity le
+                    && le != client.player && le.isAlive() && cfg.matches(le)) {
+                aimTarget = le;
+                lookingAtAimTarget = true;
+            }
+            if (aimTarget == null) aimTarget = findNearest(client, cfg);
         }
-        currentTarget = target;
-        if (target == null) return;
+        if (aimTarget == null) return;
 
-        // Тригер-бот: бьём только по видимой цели (сквозь стены ударов нет)
-        if (cfg.triggerBot && !canSee(client, target)) {
-            currentTarget = null;
-            return;
-        }
+        if (cfg.aura) {
+            // --- АУРА: скрытная ротация + удар по кулдауну ---
+            boolean aimReady = true;
+            if (lookingAtAimTarget) {
+                // камера уже смотрит на цель — сервер видит настоящую ротацию
+                fakeYaw = normAngle(client.player.getYaw());
+                fakePitch = client.player.getPitch();
+            } else {
+                // камера стоит на месте, серверу уходит доворот, а на F5 видно тело
+                float[] yp = anglesTowards(client.player, aimTarget);
+                float yawDiff = normAngle(yp[0] - fakeYaw);
+                float pitchDiff = yp[1] - fakePitch;
+                if (Math.abs(yawDiff) > 1.0f || Math.abs(pitchDiff) > 1.0f) {
+                    float yawStep = Math.max(-MAX_TURN_PER_TICK,
+                            Math.min(MAX_TURN_PER_TICK, yawDiff * TURN_FACTOR));
+                    float pitchStep = Math.max(-MAX_PITCH_TURN_PER_TICK,
+                            Math.min(MAX_PITCH_TURN_PER_TICK, pitchDiff * TURN_FACTOR));
+                    fakeYaw = normAngle(fakeYaw + yawStep);
+                    fakePitch = Math.max(-90f, Math.min(90f, fakePitch + pitchStep));
+                    aimSettled = 0; // доворот ещё идёт
+                } else {
+                    aimSettled++;
+                }
+                pendingFake = new float[]{fakeYaw, fakePitch};
+                // удар только когда доворот «устоялся» — сервер уже видит ротацию
+                aimReady = aimSettled >= 3;
+            }
 
-        // Если бьём мимо прицела — плавно доворачиваемся к цели
-        if (!lookingAtTarget) {
-            if (needsRotation(client.player, target)) {
-                rotateStep(client.player, target, TURN_FACTOR);
-                rotateDelay = 2; // после доводки ждём пару тиков, чтобы сервер получил поворот ДО удара
-                return; // пока камера крутится — не бьём
+            if (!aimReady) return;
+            if (cooldown > 0) return;
+            cooldown = Math.max(1, (int) Math.round(20.0 / Math.max(1, cfg.hitsPerSecond)));
+            attack(client, cfg, aimTarget);
+        } else if (cfg.aimAssist) {
+            // --- АИМ-АССИСТ: плавно доворачивает КАМЕРУ к цели, сам не бьёт ---
+            float[] yp = anglesTowards(client.player, aimTarget);
+            float yawDiff = normAngle(yp[0] - client.player.getYaw());
+            float pitchDiff = yp[1] - client.player.getPitch();
+            if (Math.abs(yawDiff) > 0.5f || Math.abs(pitchDiff) > 0.5f) {
+                float yawStep = Math.max(-MAX_TURN_PER_TICK,
+                        Math.min(MAX_TURN_PER_TICK, yawDiff * TURN_FACTOR));
+                float pitchStep = Math.max(-MAX_PITCH_TURN_PER_TICK,
+                        Math.min(MAX_PITCH_TURN_PER_TICK, pitchDiff * TURN_FACTOR));
+                client.player.setYaw(normAngle(client.player.getYaw() + yawStep));
+                client.player.setPitch(Math.max(-90f,
+                        Math.min(90f, client.player.getPitch() + pitchStep)));
             }
         }
-        if (rotateDelay > 0) {
-            rotateDelay--;
-            return;
-        }
-        if (cooldown > 0) return;
+    }
 
-        cooldown = Math.max(1, (int) Math.round(20.0 / Math.max(1, cfg.hitsPerSecond)));
-
+    /** Удар по цели (обычный или мгновенное убийство в одиночной игре). */
+    private static void attack(MinecraftClient client, KillAuraConfig cfg, LivingEntity target) {
+        lastHit = target;
+        client.player.swingHand(Hand.MAIN_HAND);
         if (cfg.instantKill && client.getServer() != null) {
             // Одиночная игра: убиваем сущность напрямую на серверной стороне
-            lastHit = target;
             UUID id = target.getUuid();
             RegistryKey<World> worldKey = client.world.getRegistryKey();
             MinecraftServer server = client.getServer();
-            client.player.swingHand(Hand.MAIN_HAND);
             server.execute(() -> {
                 ServerWorld world = server.getWorld(worldKey);
                 if (world == null) return;
@@ -419,17 +571,28 @@ class KillAuraHandler {
                 }
             });
         } else {
-            // Обычный удар (работает и на серверах, но с обычным уроном)
-            lastHit = target;
             client.interactionManager.attackEntity(client.player, target);
-            client.player.swingHand(Hand.MAIN_HAND);
         }
     }
 
-    /** Ближайшая подходящая сущность в радиусе ванильной атаки (от глаз до хитбокса). */
+    /** Ближайшая подходящая сущность в радиусе ванильной атаки (от глаз до хитбокса).
+     *  Цель «липкая»: держим предыдущую, пока она жива и в радиусе — иначе при
+     *  прыжках выбор мигает между сущностями и доворот дёргается. */
     private static LivingEntity findNearest(MinecraftClient client, KillAuraConfig cfg) {
         ClientPlayerEntity player = client.player;
         Vec3d eye = player.getEyePos();
+
+        // Держим текущую цель, пока она валидна
+        if (auraTarget != null) {
+            if (auraTarget.isAlive()
+                    && auraTarget.getWorld() == client.world
+                    && cfg.matches(auraTarget)
+                    && eye.squaredDistanceTo(aimPoint(auraTarget, eye)) <= REACH * REACH) {
+                return auraTarget;
+            }
+            auraTarget = null; // умерла/вышла из радиуса/сменился мир — ищем заново
+        }
+
         double bestDist = REACH * REACH;
         LivingEntity best = null;
         for (Entity e : client.world.getEntities()) {
@@ -441,6 +604,7 @@ class KillAuraHandler {
                 best = le;
             }
         }
+        auraTarget = best;
         return best;
     }
 
@@ -453,34 +617,11 @@ class KillAuraHandler {
         return hit.getType() == HitResult.Type.MISS;
     }
 
-    /** Точка прицеливания: ближайшая к глазам точка хитбокса (или центр, если глаза внутри). */
+    /** Точка прицеливания: центр хитбокса. Ближайшая точка хитбокса была
+     *  нестабильной — при движении она прыгала с края на край, и голова
+     *  дёргалась. Луч через центр всегда попадает в хитбокс. */
     private static Vec3d aimPoint(LivingEntity target, Vec3d eye) {
-        Box box = target.getBoundingBox();
-        if (eye.x >= box.minX && eye.x <= box.maxX
-                && eye.y >= box.minY && eye.y <= box.maxY
-                && eye.z >= box.minZ && eye.z <= box.maxZ) {
-            return box.getCenter();
-        }
-        return new Vec3d(
-                Math.min(Math.max(eye.x, box.minX), box.maxX),
-                Math.min(Math.max(eye.y, box.minY), box.maxY),
-                Math.min(Math.max(eye.z, box.minZ), box.maxZ));
-    }
-
-    private static boolean needsRotation(ClientPlayerEntity player, LivingEntity target) {
-        float[] yp = anglesTowards(player, target);
-        float yawDiff = Math.abs(((player.getYaw() - yp[0]) % 360.0f + 540.0f) % 360.0f - 180.0f);
-        float pitchDiff = Math.abs(player.getPitch() - yp[1]);
-        return yawDiff > 1.0f || pitchDiff > 1.0f;
-    }
-
-    /** Плавный доворот: за один тик закрываем долю оставшегося угла, а не весь разворот. */
-    private static void rotateStep(ClientPlayerEntity player, LivingEntity target, float factor) {
-        float[] yp = anglesTowards(player, target);
-        float yawDiff = ((yp[0] - player.getYaw()) % 360.0f + 540.0f) % 360.0f - 180.0f;
-        float pitchDiff = yp[1] - player.getPitch();
-        player.setYaw(player.getYaw() + yawDiff * factor);
-        player.setPitch(player.getPitch() + pitchDiff * factor);
+        return target.getBoundingBox().getCenter();
     }
 
     /** Вычисляет yaw/pitch от глаз игрока к точке прицеливания. */
@@ -495,97 +636,116 @@ class KillAuraHandler {
         float pitch = (float) (-Math.toDegrees(Math.atan2(dy, horiz)));
         return new float[]{yaw, pitch};
     }
+
+    /** Нормализует угол в диапазон [-180; 180) (используется и в миксине). */
+    public static float normAngle(float a) {
+        return ((a % 360.0f) + 540.0f) % 360.0f - 180.0f;
+    }
 }
 
 // ============================================================
-// 5. KillAuraEspRenderer — простой таргет-ESP.
-//    Хитбокс цели проецируется в экранные координаты (в конце
-//    рендера мира), прямоугольник рисуется в HUD поверх всего —
-//    поэтому виден сквозь стены. Зелёная рамка + имя цели.
+// 5. ClientPlayerEntityMixin (миксин) — сердце скрытной ротации.
+//    Прямо перед отправкой movement-пакетов подставляет «фейковые»
+//    yaw/pitch (доворот к цели), сразу после — возвращает настоящую
+//    камеру. Здесь же плавно доворачивается тело (видно на F5).
 // ============================================================
-class KillAuraEspRenderer {
+@Mixin(net.minecraft.client.network.ClientPlayerEntity.class)
+class ClientPlayerEntityMixin {
 
-    /** Экранная рамка цели в scaled-пикселях: x1, y1, x2, y2 (или null). */
-    private static int[] rect = null;
-    private static Entity rectTarget = null;
+    private boolean killonlook$fakeApplied = false;
+    private float killonlook$realYaw;
+    private float killonlook$realPitch;
 
-    private KillAuraEspRenderer() {}
+    @Inject(method = "sendMovementPackets", at = @At("HEAD"))
+    private void killonlook$applyFakeRotation(CallbackInfo ci) {
+        float[] fake = KillAuraHandler.pollFakeRotation();
+        if (fake != null) {
+            net.minecraft.client.network.ClientPlayerEntity self =
+                    (net.minecraft.client.network.ClientPlayerEntity) (Object) this;
+            killonlook$realYaw = self.getYaw();
+            killonlook$realPitch = self.getPitch();
+            self.setYaw(fake[0]);
+            self.setPitch(fake[1]);
+
+            // Тело плавно доворачивается за фейковой ротацией (видно на F5).
+            // Ставим именно здесь — ПОСЛЕ ванильного пересчёта bodyYaw/headYaw
+            // в tick(), иначе ванила откатывает их под камеру и голова дёргается.
+            float bodyDiff = KillAuraHandler.normAngle(fake[0] - self.bodyYaw);
+            self.bodyYaw += bodyDiff * 0.3f;
+            self.headYaw = fake[0];
+            killonlook$fakeApplied = true;
+        }
+    }
+
+    @Inject(method = "sendMovementPackets", at = @At("TAIL"))
+    private void killonlook$restoreRotation(CallbackInfo ci) {
+        if (killonlook$fakeApplied) {
+            net.minecraft.client.network.ClientPlayerEntity self =
+                    (net.minecraft.client.network.ClientPlayerEntity) (Object) this;
+            self.setYaw(killonlook$realYaw);
+            self.setPitch(killonlook$realPitch);
+            killonlook$fakeApplied = false;
+        }
+    }
+}
+
+// ============================================================
+// 6. KillAuraHud — HUD-элементы: водяной знак, счётчик убийств
+//    за сессию и список включённых модулей справа (как ArrayList).
+// ============================================================
+class KillAuraHud {
+
+    private static final int BG = 0x90000000;     // полупрозрачная плашка
+    private static final int ACCENT = 0xFFC79BF2; // фиолетовый акцент
+    private static final int GOOD = 0xFF8FFF8F;   // зелёный
+
+    private KillAuraHud() {}
 
     public static void register() {
-        WorldRenderEvents.LAST.register(KillAuraEspRenderer::onWorldRender);
-        HudRenderCallback.EVENT.register(KillAuraEspRenderer::onHudRender);
+        HudRenderCallback.EVENT.register(KillAuraHud::render);
     }
 
-    /** Проекция углов хитбокса цели на экран (в конце рендера мира). */
-    private static void onWorldRender(WorldRenderContext ctx) {
-        rect = null;
-        rectTarget = null;
-
-        Entity target = KillAuraHandler.currentTarget;
-        if (target == null || !target.isAlive()) return;
-        MatrixStack ms = ctx.matrixStack();
-        if (ms == null) return;
-
-        Box box = target.getBoundingBox().expand(0.1); // чуть увеличиваем, чтобы рамка не прилегала вплотную
-        Vec3d camPos = ctx.camera().getPos();
-        double cx = camPos.x, cy = camPos.y, cz = camPos.z;
-        Matrix4f view = ms.peek().getPositionMatrix();
-        Matrix4f proj = ctx.projectionMatrix();
+    private static void render(DrawContext context, RenderTickCounter tickCounter) {
         MinecraftClient client = MinecraftClient.getInstance();
-        int sw = client.getWindow().getScaledWidth();
-        int sh = client.getWindow().getScaledHeight();
+        if (client.player == null) return;
+        KillAuraConfig cfg = KillOnLookClient.config;
 
-        int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE;
-        int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE;
+        // --- Водяной знак ---
+        context.fill(3, 3, 112, 15, BG);
+        context.drawTextWithShadow(client.textRenderer, "Kill on Look v1.2.0", 6, 5, ACCENT);
 
-        // 8 углов хитбокса
-        for (int i = 0; i < 8; i++) {
-            double wx = (i & 1) == 0 ? box.minX : box.maxX;
-            double wy = (i & 2) == 0 ? box.minY : box.maxY;
-            double wz = (i & 4) == 0 ? box.minZ : box.maxZ;
-            Vector4f p = new Vector4f((float) (wx - cx), (float) (wy - cy), (float) (wz - cz), 1f);
-            view.transform(p);
-            proj.transform(p);
-            if (p.w <= 0f) return; // угол за камерой — не рисуем
-
-            int sx = Math.round((p.x / p.w * 0.5f + 0.5f) * sw);
-            int sy = Math.round((1f - (p.y / p.w * 0.5f + 0.5f)) * sh);
-            minX = Math.min(minX, sx);
-            maxX = Math.max(maxX, sx);
-            minY = Math.min(minY, sy);
-            maxY = Math.max(maxY, sy);
-        }
-
-        if (maxX - minX < 2 || maxY - minY < 2) return; // слишком далеко/мелко
-        rect = new int[]{minX, minY, maxX, maxY};
-        rectTarget = target;
-    }
-
-    /** Рисует рамку поверх всего мира (в HUD) — поэтому видна сквозь стены. */
-    private static void onHudRender(DrawContext context, RenderTickCounter tickCounter) {
-        // маленький бонус мода — счётчик убийств за сессию
+        // --- Счётчик убийств за сессию ---
         if (KillAuraHandler.kills > 0) {
-            MinecraftClient client = MinecraftClient.getInstance();
-            context.drawTextWithShadow(client.textRenderer,
-                    Text.literal("Kill on Look · убийств: " + KillAuraHandler.kills), 4, 4, 0xFF8FFF8F);
+            String k = "убийств: " + KillAuraHandler.kills;
+            int w = client.textRenderer.getWidth(k);
+            context.fill(3, 16, w + 14, 28, BG);
+            context.drawTextWithShadow(client.textRenderer, k, 6, 18, GOOD);
         }
 
-        if (!KillOnLookClient.config.esp || rect == null) return;
+        // --- Список включённых модулей (справа, как ArrayList) ---
+        List<String> mods = new ArrayList<>();
+        if (cfg.enabled) {
+            if (cfg.aura) mods.add("Аура");
+            if (cfg.aimAssist) mods.add("Аим-ассист");
+            if (cfg.triggerBot) mods.add("Тригер-бот");
+            if (cfg.autoSprint) mods.add("Авто-спринт");
 
-        int x1 = rect[0], y1 = rect[1], x2 = rect[2], y2 = rect[3];
-        int col = 0xFF40FF40; // зелёный
+            List<String> tg = new ArrayList<>();
+            if (cfg.hostile) tg.add("мобы");
+            if (cfg.animals) tg.add("животные");
+            if (cfg.villagers) tg.add("жители");
+            if (cfg.players) tg.add("игроки");
+            if (!tg.isEmpty()) mods.add("цели: " + String.join(", ", tg));
+        }
 
-        // лёгкая заливка + рамка
-        context.fill(x1, y1, x2, y2, 0x2840FF40);
-        context.fill(x1, y1, x2, y1 + 1, col);
-        context.fill(x1, y2 - 1, x2, y2, col);
-        context.fill(x1, y1, x1 + 1, y2, col);
-        context.fill(x2 - 1, y1, x2, y2, col);
-
-        // имя цели над рамкой
-        if (rectTarget != null) {
-            MinecraftClient client = MinecraftClient.getInstance();
-            context.drawTextWithShadow(client.textRenderer, rectTarget.getName(), x1, y1 - 11, 0xFFE6FF70);
+        int sw = client.getWindow().getScaledWidth();
+        int y = 3;
+        for (String m : mods) {
+            int w = client.textRenderer.getWidth(m);
+            int x = sw - w - 5;
+            context.fill(x - 2, y - 1, x + w + 2, y + 9, BG);
+            context.drawTextWithShadow(client.textRenderer, m, x, y, ACCENT);
+            y += 10;
         }
     }
 }
